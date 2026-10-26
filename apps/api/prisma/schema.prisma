@@ -1,0 +1,464 @@
+// MediChain — PostgreSQL schema (Prisma ORM)
+//
+// Design notes
+// - Medicine (product information) is separated from MedicineBatch (a physical lot).
+// - Custody is tracked as whole-batch custody: MedicineBatch.currentCustodianId always points
+//   at the organization that holds the batch. CustodyTransfer rows model the handover workflow.
+// - SupplyChainEvent is an append-only, per-batch hash chain (prevHash -> hash). It is the
+//   tamper-evident record that is anchored to the blockchain (or the simulated ledger).
+// - BlockchainTransaction records either a real on-chain transaction (txHash/blockNumber) or a
+//   clearly labelled simulated ledger entry (simulatedRef). The two are never mixed.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  REGULATOR
+  MANUFACTURER
+  DISTRIBUTOR
+  WHOLESALER
+  PHARMACY
+}
+
+enum UserStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum OrganizationType {
+  REGULATOR
+  MANUFACTURER
+  DISTRIBUTOR
+  WHOLESALER
+  PHARMACY
+}
+
+enum OrganizationStatus {
+  PENDING
+  APPROVED
+  SUSPENDED
+}
+
+enum BatchStatus {
+  ACTIVE
+  RECALLED
+  BLOCKED
+}
+
+enum TransferStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+  CANCELLED
+}
+
+enum EventType {
+  REGISTERED
+  TRANSFER_INITIATED
+  TRANSFER_ACCEPTED
+  TRANSFER_REJECTED
+  TRANSFER_CANCELLED
+  RECALLED
+  BLOCKED
+  FLAGGED
+  FLAG_RESOLVED
+  DISPENSED
+}
+
+enum RecallAction {
+  RECALL
+  BLOCK
+}
+
+enum RecallClass {
+  CLASS_I
+  CLASS_II
+  CLASS_III
+}
+
+enum FlagStatus {
+  OPEN
+  RESOLVED
+  DISMISSED
+}
+
+enum VerificationResult {
+  VERIFIED
+  SUSPICIOUS
+  UNKNOWN
+  RECALLED
+  EXPIRED
+}
+
+enum VerificationChannel {
+  PUBLIC
+  PARTNER
+}
+
+enum ChainMode {
+  SIMULATION
+  ONCHAIN
+}
+
+enum ChainTxStatus {
+  PENDING
+  CONFIRMED
+  FAILED
+}
+
+enum ChainOperation {
+  REGISTER_ORGANIZATION
+  SET_ORGANIZATION_STATUS
+  REGISTER_BATCH
+  INITIATE_TRANSFER
+  ACCEPT_TRANSFER
+  REJECT_TRANSFER
+  RECALL_BATCH
+  LOG_EVENT
+}
+
+enum NotificationSeverity {
+  INFO
+  SUCCESS
+  WARNING
+  CRITICAL
+}
+
+model Organization {
+  id            String             @id @default(cuid())
+  name          String
+  type          OrganizationType
+  status        OrganizationStatus @default(PENDING)
+  licenseNumber String             @unique
+  email         String?
+  phone         String?
+  addressLine   String?
+  city          String?
+  country       String?
+  /// keccak256 reference used on-chain (no business data on-chain)
+  chainRef      String             @unique
+  isDemo        Boolean            @default(false)
+  approvedAt    DateTime?
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+
+  memberships        OrganizationMembership[]
+  medicines          Medicine[]
+  manufacturedBatches MedicineBatch[]          @relation("BatchManufacturer")
+  custodyBatches     MedicineBatch[]          @relation("BatchCustodian")
+  outgoingTransfers  CustodyTransfer[]        @relation("TransferFrom")
+  incomingTransfers  CustodyTransfer[]        @relation("TransferTo")
+  eventsAsActor      SupplyChainEvent[]       @relation("EventActorOrg")
+  eventsAsFrom       SupplyChainEvent[]       @relation("EventFromOrg")
+  eventsAsTo         SupplyChainEvent[]       @relation("EventToOrg")
+  flags              BatchFlag[]
+  auditLogs          AuditLog[]
+
+  @@index([type, status])
+}
+
+model User {
+  id           String     @id @default(cuid())
+  email        String     @unique
+  passwordHash String
+  fullName     String
+  role         UserRole
+  status       UserStatus @default(ACTIVE)
+  /// bumped on password change / forced logout to invalidate existing JWTs
+  tokenVersion Int        @default(0)
+  lastLoginAt  DateTime?
+  isDemo       Boolean    @default(false)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  membership          OrganizationMembership?
+  registeredBatches   MedicineBatch[]         @relation("BatchRegisteredBy")
+  initiatedTransfers  CustodyTransfer[]       @relation("TransferInitiatedBy")
+  respondedTransfers  CustodyTransfer[]       @relation("TransferRespondedBy")
+  events              SupplyChainEvent[]
+  recalls             RecallRecord[]
+  flagsRaised         BatchFlag[]             @relation("FlagRaisedBy")
+  flagsResolved       BatchFlag[]             @relation("FlagResolvedBy")
+  notifications       Notification[]
+  auditLogs           AuditLog[]
+  verificationAttempts VerificationAttempt[]
+}
+
+/// A user belongs to exactly one organization; the organization type determines the user's role.
+model OrganizationMembership {
+  id             String       @id @default(cuid())
+  userId         String       @unique
+  organizationId String
+  title          String?
+  createdAt      DateTime     @default(now())
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+
+  @@index([organizationId])
+}
+
+/// Medicine product information (shared by many batches).
+model Medicine {
+  id             String   @id @default(cuid())
+  name           String
+  genericName    String
+  category       String
+  dosageForm     String?
+  /// empty string when not applicable (kept non-null so it can take part in the unique key)
+  strength       String   @default("")
+  description    String?
+  packagingRef   String?
+  manufacturerId String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  manufacturer Organization    @relation(fields: [manufacturerId], references: [id], onDelete: Restrict)
+  batches      MedicineBatch[]
+
+  @@unique([manufacturerId, name, genericName, strength])
+  @@index([name])
+}
+
+/// A physical production lot of a medicine.
+model MedicineBatch {
+  id                  String      @id @default(cuid())
+  /// Opaque public identifier encoded into QR codes (e.g. MC-7KQ2-XP4M-9TBA)
+  publicId            String      @unique
+  /// Manufacturer's own lot / batch number — unique per manufacturer
+  batchNumber         String
+  medicineId          String
+  manufacturerId      String
+  manufacturerLicense String
+  manufactureDate     DateTime    @db.Date
+  expiryDate          DateTime    @db.Date
+  quantity            Int
+  /// Units still held by the current custodian (decreases only when a pharmacy dispenses)
+  quantityOnHand      Int
+  unit                String
+  storageConditions   String
+  notes               String?
+  status              BatchStatus @default(ACTIVE)
+  currentCustodianId  String
+  registeredById      String
+  /// keccak256 of the publicId — the only batch reference stored on-chain
+  chainRef            String      @unique
+  /// keccak256 of the canonical batch record at registration time
+  dataHash            String
+  isDemo              Boolean     @default(false)
+  createdAt           DateTime    @default(now())
+  updatedAt           DateTime    @updatedAt
+
+  medicine         Medicine              @relation(fields: [medicineId], references: [id], onDelete: Restrict)
+  manufacturer     Organization          @relation("BatchManufacturer", fields: [manufacturerId], references: [id], onDelete: Restrict)
+  currentCustodian Organization          @relation("BatchCustodian", fields: [currentCustodianId], references: [id], onDelete: Restrict)
+  registeredBy     User                  @relation("BatchRegisteredBy", fields: [registeredById], references: [id], onDelete: Restrict)
+  transfers        CustodyTransfer[]
+  events           SupplyChainEvent[]
+  recalls          RecallRecord[]
+  flags            BatchFlag[]
+  verifications    VerificationAttempt[]
+  chainTxs         BlockchainTransaction[]
+
+  @@unique([manufacturerId, batchNumber])
+  @@index([currentCustodianId])
+  @@index([status])
+  @@index([expiryDate])
+  @@index([createdAt])
+}
+
+/// Whole-batch custody handover. At most one PENDING transfer per batch is enforced by a
+/// partial unique index (see migration) in addition to row locking in the service layer.
+model CustodyTransfer {
+  id              String         @id @default(cuid())
+  reference       String         @unique
+  batchId         String
+  fromOrgId       String
+  toOrgId         String
+  quantity        Int
+  status          TransferStatus @default(PENDING)
+  notes           String?
+  responseNote    String?
+  initiatedById   String
+  respondedById   String?
+  createdAt       DateTime       @default(now())
+  respondedAt     DateTime?
+
+  batch       MedicineBatch     @relation(fields: [batchId], references: [id], onDelete: Restrict)
+  fromOrg     Organization      @relation("TransferFrom", fields: [fromOrgId], references: [id], onDelete: Restrict)
+  toOrg       Organization      @relation("TransferTo", fields: [toOrgId], references: [id], onDelete: Restrict)
+  initiatedBy User              @relation("TransferInitiatedBy", fields: [initiatedById], references: [id], onDelete: Restrict)
+  respondedBy User?             @relation("TransferRespondedBy", fields: [respondedById], references: [id], onDelete: Restrict)
+  events      SupplyChainEvent[]
+
+  @@index([batchId, status])
+  @@index([toOrgId, status])
+  @@index([fromOrgId, status])
+  @@index([createdAt])
+}
+
+/// Append-only, hash-chained supply-chain event log (per batch).
+model SupplyChainEvent {
+  id          String    @id @default(cuid())
+  batchId     String
+  sequence    Int
+  type        EventType
+  actorUserId String?
+  actorOrgId  String?
+  fromOrgId   String?
+  toOrgId     String?
+  transferId  String?
+  recallId    String?
+  data        Json      @default("{}")
+  prevHash    String
+  hash        String    @unique
+  createdAt   DateTime  @default(now())
+
+  batch    MedicineBatch    @relation(fields: [batchId], references: [id], onDelete: Restrict)
+  actor    User?            @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+  actorOrg Organization?    @relation("EventActorOrg", fields: [actorOrgId], references: [id], onDelete: Restrict)
+  fromOrg  Organization?    @relation("EventFromOrg", fields: [fromOrgId], references: [id], onDelete: Restrict)
+  toOrg    Organization?    @relation("EventToOrg", fields: [toOrgId], references: [id], onDelete: Restrict)
+  transfer CustodyTransfer? @relation(fields: [transferId], references: [id], onDelete: Restrict)
+  recall   RecallRecord?    @relation(fields: [recallId], references: [id], onDelete: Restrict)
+  chainTxs BlockchainTransaction[]
+
+  @@unique([batchId, sequence])
+  @@index([createdAt])
+  @@index([type])
+}
+
+model RecallRecord {
+  id             String        @id @default(cuid())
+  reference      String        @unique
+  batchId        String
+  action         RecallAction  @default(RECALL)
+  classification RecallClass
+  reason         String
+  initiatedById  String
+  createdAt      DateTime      @default(now())
+
+  batch       MedicineBatch      @relation(fields: [batchId], references: [id], onDelete: Restrict)
+  initiatedBy User               @relation(fields: [initiatedById], references: [id], onDelete: Restrict)
+  events      SupplyChainEvent[]
+
+  @@index([createdAt])
+}
+
+/// Suspicion raised by a supply-chain partner (typically a pharmacy) for regulatory review.
+model BatchFlag {
+  id           String     @id @default(cuid())
+  batchId      String
+  raisedById   String
+  orgId        String
+  reason       String
+  status       FlagStatus @default(OPEN)
+  resolution   String?
+  resolvedById String?
+  createdAt    DateTime   @default(now())
+  resolvedAt   DateTime?
+
+  batch      MedicineBatch @relation(fields: [batchId], references: [id], onDelete: Restrict)
+  raisedBy   User          @relation("FlagRaisedBy", fields: [raisedById], references: [id], onDelete: Restrict)
+  resolvedBy User?         @relation("FlagResolvedBy", fields: [resolvedById], references: [id], onDelete: Restrict)
+  org        Organization  @relation(fields: [orgId], references: [id], onDelete: Restrict)
+
+  @@index([status])
+  @@index([batchId])
+}
+
+/// Privacy-conscious log of verification look-ups: no raw IP, no user agent, no location.
+model VerificationAttempt {
+  id        String              @id @default(cuid())
+  batchId   String?
+  /// The identifier that was queried (truncated, may be unknown/garbage)
+  queriedId String
+  result    VerificationResult
+  reasons   Json                @default("[]")
+  channel   VerificationChannel @default(PUBLIC)
+  userId    String?
+  /// Salted, truncated hash of the client IP — used only for abuse/rate analysis
+  clientHash String?
+  createdAt DateTime            @default(now())
+
+  batch MedicineBatch? @relation(fields: [batchId], references: [id], onDelete: SetNull)
+  user  User?          @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([batchId, createdAt])
+  @@index([result, createdAt])
+  @@index([createdAt])
+}
+
+model BlockchainTransaction {
+  id              String         @id @default(cuid())
+  mode            ChainMode
+  operation       ChainOperation
+  status          ChainTxStatus  @default(PENDING)
+  batchId         String?
+  eventId         String?
+  organizationId  String?
+  /// The hash that was anchored (normally SupplyChainEvent.hash)
+  payloadHash     String
+  // ---- real on-chain fields (ONCHAIN mode only) ----
+  txHash          String?        @unique
+  blockNumber     Int?
+  chainId         Int?
+  contractAddress String?
+  // ---- simulated ledger fields (SIMULATION mode only) ----
+  simulatedRef    String?        @unique
+  ledgerSequence  Int?           @unique
+  prevLedgerHash  String?
+  ledgerHash      String?
+  error           String?
+  attempts        Int            @default(0)
+  createdAt       DateTime       @default(now())
+  confirmedAt     DateTime?
+
+  batch MedicineBatch?    @relation(fields: [batchId], references: [id], onDelete: SetNull)
+  event SupplyChainEvent? @relation(fields: [eventId], references: [id], onDelete: SetNull)
+
+  @@index([status, createdAt])
+  @@index([batchId])
+  @@index([createdAt])
+}
+
+model Notification {
+  id        String               @id @default(cuid())
+  userId    String
+  severity  NotificationSeverity @default(INFO)
+  title     String
+  message   String
+  link      String?
+  readAt    DateTime?
+  createdAt DateTime             @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+  @@index([createdAt])
+}
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  actorUserId String?
+  actorOrgId  String?
+  action      String
+  entityType  String
+  entityId    String?
+  metadata    Json     @default("{}")
+  clientHash  String?
+  createdAt   DateTime @default(now())
+
+  actor    User?         @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+  actorOrg Organization? @relation(fields: [actorOrgId], references: [id], onDelete: SetNull)
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+  @@index([action])
+}

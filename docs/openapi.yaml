@@ -1,0 +1,507 @@
+openapi: 3.0.3
+info:
+  title: MediChain API
+  version: 1.0.0
+  description: |
+    REST API for MediChain — medicine supply-chain traceability.
+
+    **Authentication.** `POST /api/auth/login` sets an httpOnly `mc_session` cookie (JWT, HS256) and a
+    readable `mc_csrf` cookie. Every state-changing request made with a session must echo the CSRF value
+    in the `X-CSRF-Token` header (double-submit cookie). Public endpoints (`/api/verify/*`,
+    `/api/blockchain/status`, `/api/health`, `/api/config`) need no session.
+
+    **Authorization** is enforced server-side by role (REGULATOR, MANUFACTURER, DISTRIBUTOR, WHOLESALER,
+    PHARMACY) and by data ownership (partners only see batches they made, hold or handled).
+
+    **Errors** always use `{ "error": { "code": "...", "message": "...", "details": ... } }`.
+    Validation errors return 400 `VALIDATION_ERROR` with `details: [{ path, message }]`.
+
+    **Blockchain fields.** `txHash`/`blockNumber` are only populated for real on-chain transactions
+    (`mode: ONCHAIN`). `simulatedRef` (`SIM-…`) is only populated in simulation mode. A database event ID is
+    never a blockchain transaction.
+servers:
+  - url: http://localhost:4000
+    description: Local development
+tags:
+  - name: Auth
+  - name: Batches
+  - name: Transfers
+  - name: Verification
+  - name: Recalls
+  - name: Organizations & users
+  - name: Reports
+  - name: Blockchain
+  - name: System
+components:
+  securitySchemes:
+    session:
+      type: apiKey
+      in: cookie
+      name: mc_session
+    csrf:
+      type: apiKey
+      in: header
+      name: X-CSRF-Token
+  parameters:
+    page: { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+    pageSize: { name: pageSize, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 10 } }
+    search: { name: search, in: query, schema: { type: string, maxLength: 100 } }
+    order: { name: order, in: query, schema: { type: string, enum: [asc, desc], default: desc } }
+    id: { name: id, in: path, required: true, schema: { type: string } }
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string, example: TRANSFER_PENDING }
+            message: { type: string }
+            details: {}
+    Role: { type: string, enum: [REGULATOR, MANUFACTURER, DISTRIBUTOR, WHOLESALER, PHARMACY] }
+    OrgRef:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        type: { $ref: '#/components/schemas/Role' }
+        status: { type: string, enum: [PENDING, APPROVED, SUSPENDED] }
+        city: { type: string, nullable: true }
+        country: { type: string, nullable: true }
+    Paged:
+      type: object
+      properties:
+        items: { type: array, items: {} }
+        total: { type: integer }
+        page: { type: integer }
+        pageSize: { type: integer }
+        totalPages: { type: integer }
+    Batch:
+      type: object
+      properties:
+        id: { type: string }
+        publicId: { type: string, example: MC-7KQ2-XP4M-9TBA, description: Opaque identifier encoded in QR codes }
+        batchNumber: { type: string, example: AMX-2026-0915 }
+        medicine:
+          type: object
+          properties:
+            id: { type: string }
+            name: { type: string }
+            genericName: { type: string }
+            category: { type: string }
+            strength: { type: string }
+            dosageForm: { type: string, nullable: true }
+        manufacturer: { $ref: '#/components/schemas/OrgRef' }
+        currentCustodian: { $ref: '#/components/schemas/OrgRef' }
+        manufactureDate: { type: string, format: date }
+        expiryDate: { type: string, format: date }
+        quantity: { type: integer }
+        quantityOnHand: { type: integer }
+        unit: { type: string }
+        status: { type: string, enum: [ACTIVE, RECALLED, BLOCKED] }
+        displayStatus: { type: string, enum: [ACTIVE, IN_TRANSIT, RECALLED, BLOCKED, EXPIRED] }
+        hasPendingTransfer: { type: boolean }
+    CreateBatch:
+      type: object
+      required: [medicine, batchNumber, manufacturerLicense, manufactureDate, expiryDate, quantity, unit, storageConditions]
+      properties:
+        medicine:
+          type: object
+          required: [name, genericName, category]
+          properties:
+            name: { type: string, maxLength: 120 }
+            genericName: { type: string, maxLength: 120 }
+            category: { type: string, maxLength: 60 }
+            dosageForm: { type: string, nullable: true }
+            strength: { type: string, nullable: true }
+            description: { type: string, nullable: true }
+            packagingRef: { type: string, nullable: true }
+        batchNumber: { type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9\-/.]*$', minLength: 3, maxLength: 40, description: Unique per manufacturer }
+        manufacturerLicense: { type: string, description: Must match the licence on record for the caller's organization }
+        manufactureDate: { type: string, format: date, description: Not in the future }
+        expiryDate: { type: string, format: date, description: After manufactureDate and after today }
+        quantity: { type: integer, minimum: 1 }
+        unit: { type: string }
+        storageConditions: { type: string, maxLength: 200 }
+        notes: { type: string, nullable: true }
+        initialRecipientId: { type: string, nullable: true, description: Optional distributor to ship to immediately }
+    Transfer:
+      type: object
+      properties:
+        id: { type: string }
+        reference: { type: string, example: SHP-2026-7QK2XD }
+        status: { type: string, enum: [PENDING, ACCEPTED, REJECTED, CANCELLED] }
+        quantity: { type: integer }
+        fromOrg: { $ref: '#/components/schemas/OrgRef' }
+        toOrg: { $ref: '#/components/schemas/OrgRef' }
+        createdAt: { type: string, format: date-time }
+        respondedAt: { type: string, format: date-time, nullable: true }
+    JourneyStage:
+      type: object
+      properties:
+        key: { type: string }
+        role: { $ref: '#/components/schemas/Role' }
+        status: { type: string, enum: [completed, current, in_transit, rejected, cancelled, missing, unrecorded, upcoming] }
+        org: { type: object, nullable: true }
+        shipmentRef: { type: string, nullable: true }
+        initiatedAt: { type: string, format: date-time, nullable: true }
+        completedAt: { type: string, format: date-time, nullable: true }
+        eventId: { type: string, nullable: true, description: Database event ID (not a blockchain transaction) }
+        eventHash: { type: string, nullable: true }
+        anchor:
+          type: object
+          nullable: true
+          properties:
+            kind: { type: string, enum: [TX_HASH, SIMULATED_REF] }
+            reference: { type: string, nullable: true }
+            status: { type: string, enum: [PENDING, CONFIRMED, FAILED] }
+            blockNumber: { type: integer, nullable: true }
+    ChainCheck:
+      type: object
+      properties:
+        mode: { type: string, enum: [SIMULATION, ONCHAIN] }
+        available: { type: boolean }
+        consistent: { type: boolean, nullable: true, description: 'true = matches, false = mismatch, null = undetermined' }
+        summary: { type: string }
+        problems: { type: array, items: { type: string } }
+        notes: { type: array, items: { type: string } }
+        anchored: { type: integer }
+        pending: { type: integer }
+        failed: { type: integer }
+        latest:
+          type: object
+          properties:
+            reference: { type: string }
+            kind: { type: string, enum: [TX_HASH, SIMULATED_REF] }
+            blockNumber: { type: integer, nullable: true }
+            logCheck: { type: string }
+    Verification:
+      type: object
+      properties:
+        result: { type: string, enum: [VERIFIED, SUSPICIOUS, UNKNOWN, RECALLED, EXPIRED] }
+        headline: { type: string }
+        reasons: { type: array, items: { type: string } }
+        queriedId: { type: string }
+        verifiedAt: { type: string, format: date-time }
+        disclaimer: { type: string }
+        checks:
+          type: array
+          items:
+            type: object
+            properties:
+              key: { type: string }
+              label: { type: string }
+              status: { type: string, enum: [pass, fail, warn, info] }
+              detail: { type: string }
+        batch: { type: object, nullable: true }
+        recall: { type: object, nullable: true }
+        journey: { type: array, items: { $ref: '#/components/schemas/JourneyStage' } }
+        events: { type: array, items: { type: object } }
+        chain: { $ref: '#/components/schemas/ChainCheck' }
+    ChainTx:
+      type: object
+      properties:
+        id: { type: string }
+        mode: { type: string, enum: [SIMULATION, ONCHAIN] }
+        operation: { type: string, enum: [REGISTER_ORGANIZATION, SET_ORGANIZATION_STATUS, REGISTER_BATCH, INITIATE_TRANSFER, ACCEPT_TRANSFER, REJECT_TRANSFER, RECALL_BATCH, LOG_EVENT] }
+        status: { type: string, enum: [PENDING, CONFIRMED, FAILED] }
+        payloadHash: { type: string, description: Anchored hash (normally the SupplyChainEvent hash) }
+        txHash: { type: string, nullable: true, description: ONCHAIN only }
+        blockNumber: { type: integer, nullable: true, description: ONCHAIN only }
+        chainId: { type: integer, nullable: true }
+        contractAddress: { type: string, nullable: true }
+        simulatedRef: { type: string, nullable: true, description: SIMULATION only (e.g. SIM-000042-1A2B3C4D) }
+        ledgerSequence: { type: integer, nullable: true }
+        ledgerHash: { type: string, nullable: true }
+        prevLedgerHash: { type: string, nullable: true }
+        error: { type: string, nullable: true }
+security:
+  - session: []
+paths:
+  /api/health:
+    get:
+      tags: [System]
+      security: []
+      summary: Liveness and database connectivity
+      responses: { '200': { description: OK }, '503': { description: Database unavailable } }
+  /api/config:
+    get:
+      tags: [System]
+      security: []
+      summary: Public client configuration (demo mode, blockchain mode, public app URL)
+      responses: { '200': { description: OK } }
+
+  /api/auth/login:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Sign in (rate limited — 10 failed attempts / 15 min / IP)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+                remember: { type: boolean, description: 7-day persistent cookie instead of a 12-hour session cookie }
+      responses:
+        '200': { description: Signed in; sets mc_session and mc_csrf cookies. Body { user, csrfToken } }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /api/auth/register:
+    post:
+      tags: [Auth]
+      security: []
+      summary: >-
+        Self-service sign-up (rate limited — 5 attempts / hour / IP). Creates a new organization in PENDING status and its
+        first user (role = organization type), then signs the user in. Supply-chain actions stay blocked until a regulator
+        approves the organization. Regulator accounts cannot be self-registered; unknown fields are rejected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [fullName, email, password, confirmPassword, organization, acceptTerms]
+              properties:
+                fullName: { type: string, minLength: 2, maxLength: 120 }
+                email: { type: string, format: email, description: Normalised to lower case }
+                password: { type: string, minLength: 10, maxLength: 128, description: At least one letter and one number }
+                confirmPassword: { type: string, description: Must equal password }
+                jobTitle: { type: string, maxLength: 80, nullable: true }
+                organization:
+                  type: object
+                  additionalProperties: false
+                  required: [name, type, licenseNumber]
+                  properties:
+                    name: { type: string, minLength: 2, maxLength: 120 }
+                    type: { type: string, enum: [MANUFACTURER, DISTRIBUTOR, WHOLESALER, PHARMACY] }
+                    licenseNumber: { type: string, minLength: 4, maxLength: 60, description: Stored upper case; must be unique }
+                    phone: { type: string, maxLength: 40, nullable: true }
+                    city: { type: string, maxLength: 80, nullable: true }
+                    country: { type: string, maxLength: 80, nullable: true }
+                acceptTerms: { type: boolean, enum: [true] }
+      responses:
+        '201': { description: Registered and signed in; sets mc_session and mc_csrf cookies. Body { user, csrfToken } }
+        '400': { $ref: '#/components/responses/Error' }
+        '409': { description: 'DUPLICATE_EMAIL, DUPLICATE_LICENSE or ALREADY_SIGNED_IN', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '429': { $ref: '#/components/responses/Error' }
+  /api/auth/logout:
+    post: { tags: [Auth], summary: Sign out (clears cookies), responses: { '200': { description: OK } } }
+  /api/auth/me:
+    get: { tags: [Auth], summary: Current user and organization, responses: { '200': { description: OK }, '401': { $ref: '#/components/responses/Error' } } }
+  /api/auth/forgot-password:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Request a password reset (always 202; email delivery is not configured in the prototype)
+      responses: { '202': { description: Accepted } }
+
+  /api/dashboard:
+    get: { tags: [Reports], summary: Role-scoped dashboard statistics computed from stored data, responses: { '200': { description: OK } } }
+
+  /api/batches:
+    get:
+      tags: [Batches]
+      summary: List batches visible to the caller
+      parameters:
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/pageSize'
+        - $ref: '#/components/parameters/search'
+        - $ref: '#/components/parameters/order'
+        - { name: sort, in: query, schema: { type: string, enum: [createdAt, expiryDate, batchNumber, medicine, quantity] } }
+        - { name: status, in: query, schema: { type: string, enum: [ACTIVE, IN_TRANSIT, RECALLED, BLOCKED, EXPIRED, EXPIRING] } }
+        - { name: scope, in: query, schema: { type: string, enum: [all, custody], default: all } }
+      responses:
+        '200': { description: Paged list of Batch, content: { application/json: { schema: { $ref: '#/components/schemas/Paged' } } } }
+    post:
+      tags: [Batches]
+      summary: Register a batch (approved MANUFACTURER only)
+      security: [{ session: [], csrf: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateBatch' } } } }
+      responses:
+        '201': { description: 'Created — { batch, verificationUrl, transfer }' }
+        '400': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { description: DUPLICATE_BATCH, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { description: LICENSE_MISMATCH / INVALID_DATES, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /api/batches/{id}:
+    get:
+      tags: [Batches]
+      summary: Batch details with integrity assessment, journey, hash-chained events, transfers, recalls, flags and caller permissions
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses: { '200': { description: OK }, '404': { $ref: '#/components/responses/Error' } }
+  /api/batches/{id}/qr:
+    get:
+      tags: [Batches]
+      summary: QR code image encoding <PUBLIC_APP_URL>/verify/<publicId> (no personal data)
+      parameters:
+        - $ref: '#/components/parameters/id'
+        - { name: format, in: query, schema: { type: string, enum: [png, svg], default: png } }
+      responses: { '200': { description: image/png or image/svg+xml } }
+  /api/batches/{id}/dispense:
+    post:
+      tags: [Batches]
+      summary: Record units dispensed (PHARMACY custodian; never below zero; blocked for recalled/expired batches)
+      security: [{ session: [], csrf: [] }]
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      requestBody: { content: { application/json: { schema: { type: object, required: [quantity], properties: { quantity: { type: integer, minimum: 1 } } } } } }
+      responses: { '200': { description: '{ quantityOnHand }' }, '422': { $ref: '#/components/responses/Error' } }
+  /api/batches/{id}/flags:
+    post:
+      tags: [Batches]
+      summary: Flag a batch as suspicious for regulatory review (partners)
+      security: [{ session: [], csrf: [] }]
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      requestBody: { content: { application/json: { schema: { type: object, required: [reason], properties: { reason: { type: string, minLength: 10 } } } } } }
+      responses: { '201': { description: Created }, '409': { $ref: '#/components/responses/Error' } }
+
+  /api/transfers:
+    get:
+      tags: [Transfers]
+      summary: List incoming / outgoing custody transfers
+      parameters:
+        - { name: direction, in: query, schema: { type: string, enum: [incoming, outgoing, all] } }
+        - { name: status, in: query, schema: { type: string, enum: [PENDING, ACCEPTED, REJECTED, CANCELLED] } }
+        - $ref: '#/components/parameters/search'
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/pageSize'
+      responses: { '200': { description: Paged list of Transfer } }
+    post:
+      tags: [Transfers]
+      summary: Initiate a whole-batch custody transfer (current custodian only, next stage only, one pending per batch)
+      security: [{ session: [], csrf: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, required: [batchId, toOrgId], properties: { batchId: { type: string }, toOrgId: { type: string }, notes: { type: string } } }
+      responses:
+        '201': { description: Created }
+        '403': { description: NOT_CUSTODIAN }
+        '409': { description: TRANSFER_PENDING }
+        '422': { description: INVALID_ROUTE / RECIPIENT_NOT_AUTHORIZED / BATCH_RECALLED / BATCH_EXPIRED / PARTIAL_BATCH }
+  /api/transfers/recipients:
+    get: { tags: [Transfers], summary: Approved organizations of the next supply-chain stage, responses: { '200': { description: '{ items, nextStage }' } } }
+  /api/transfers/{id}:
+    get: { tags: [Transfers], summary: Transfer details (parties and regulators only), parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /api/transfers/{id}/accept:
+    post:
+      tags: [Transfers]
+      summary: Accept (intended recipient only, exactly once — row-locked)
+      security: [{ session: [], csrf: [] }]
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses: { '200': { description: OK }, '403': { description: Not the recipient }, '409': { description: TRANSFER_ALREADY_RESOLVED / CUSTODY_CHANGED } }
+  /api/transfers/{id}/reject:
+    post:
+      tags: [Transfers]
+      summary: Reject with a reason (intended recipient only)
+      security: [{ session: [], csrf: [] }]
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      requestBody: { content: { application/json: { schema: { type: object, required: [reason], properties: { reason: { type: string, minLength: 5 } } } } } }
+      responses: { '200': { description: OK } }
+
+  /api/verify/{code}:
+    get:
+      tags: [Verification]
+      security: []
+      summary: Public verification by identifier or full verification URL (rate limited 30/min/IP; logs a privacy-conscious attempt)
+      parameters: [{ name: code, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: Verification result (UNKNOWN for unregistered identifiers), content: { application/json: { schema: { $ref: '#/components/schemas/Verification' } } } }
+        '429': { $ref: '#/components/responses/Error' }
+
+  /api/recalls:
+    get: { tags: [Recalls], summary: Recall history (scoped for partners), responses: { '200': { description: OK } } }
+    post:
+      tags: [Recalls]
+      summary: Recall or block a batch (REGULATOR only). Cancels any pending transfer and notifies involved organizations.
+      security: [{ session: [], csrf: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [batchId, classification, reason]
+              properties:
+                batchId: { type: string }
+                action: { type: string, enum: [RECALL, BLOCK], default: RECALL }
+                classification: { type: string, enum: [CLASS_I, CLASS_II, CLASS_III] }
+                reason: { type: string, minLength: 10 }
+      responses: { '201': { description: Created }, '403': { description: Not a regulator }, '409': { description: ALREADY_RECALLED } }
+  /api/recalls/{id}:
+    get: { tags: [Recalls], summary: Recall details, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /api/flags:
+    get: { tags: [Recalls], summary: Suspicion flags (REGULATOR), responses: { '200': { description: OK } } }
+  /api/flags/{id}/resolve:
+    post: { tags: [Recalls], summary: Resolve or dismiss a flag (REGULATOR), parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+
+  /api/organizations:
+    get: { tags: [Organizations & users], summary: Organization directory (partners see approved only), responses: { '200': { description: OK } } }
+    post: { tags: [Organizations & users], summary: Create organization (REGULATOR), responses: { '201': { description: Created }, '409': { description: DUPLICATE_LICENSE } } }
+  /api/organizations/{id}/status:
+    patch: { tags: [Organizations & users], summary: Approve or suspend (REGULATOR), parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /api/users:
+    get: { tags: [Organizations & users], summary: List users (REGULATOR), responses: { '200': { description: OK } } }
+    post: { tags: [Organizations & users], summary: Create a user; role follows the organization type (REGULATOR), responses: { '201': { description: Created } } }
+  /api/users/{id}:
+    patch: { tags: [Organizations & users], summary: Enable/disable or rename a user (disabling revokes sessions), parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /api/me:
+    patch: { tags: [Organizations & users], summary: Update own profile name, responses: { '200': { description: OK } } }
+  /api/me/password:
+    post: { tags: [Organizations & users], summary: Change own password (other sessions are invalidated), responses: { '200': { description: OK } } }
+  /api/notifications:
+    get: { tags: [Organizations & users], summary: Own notifications with unread count, responses: { '200': { description: OK } } }
+  /api/notifications/{id}/read:
+    post: { tags: [Organizations & users], summary: Mark one notification read, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /api/notifications/read-all:
+    post: { tags: [Organizations & users], summary: Mark all read, responses: { '200': { description: OK } } }
+
+  /api/reports/summary:
+    get: { tags: [Reports], summary: Aggregated analytics (weekly activity, transfer / verification / chain breakdowns), responses: { '200': { description: OK } } }
+  /api/reports/data:
+    get:
+      tags: [Reports]
+      summary: Tabular report data
+      parameters:
+        - { name: type, in: query, schema: { type: string, enum: [batches, expiring, expired, recalls, transfers, verifications, organizations, blockchain] } }
+        - { name: from, in: query, schema: { type: string, format: date } }
+        - { name: to, in: query, schema: { type: string, format: date } }
+        - { name: status, in: query, schema: { type: string } }
+        - $ref: '#/components/parameters/search'
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/pageSize'
+      responses: { '200': { description: '{ columns, rows, total, page, pageSize, totalPages }' } }
+  /api/reports/export:
+    get: { tags: [Reports], summary: Same as /reports/data but returns CSV (formula-injection safe, max 10,000 rows), responses: { '200': { description: text/csv } } }
+  /api/audit-logs:
+    get: { tags: [Reports], summary: Append-only audit trail (REGULATOR), responses: { '200': { description: OK } } }
+
+  /api/blockchain/status:
+    get: { tags: [Blockchain], security: [], summary: Active mode and connectivity (no secrets), responses: { '200': { description: OK } } }
+  /api/blockchain/transactions:
+    get: { tags: [Blockchain], summary: Blockchain transactions or simulated ledger entries (current mode only), responses: { '200': { description: Paged list of ChainTx } } }
+  /api/blockchain/transactions/{id}:
+    get: { tags: [Blockchain], summary: One record with its database event, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /api/blockchain/transactions/{id}/verify:
+    post:
+      tags: [Blockchain]
+      summary: Re-verify one record — re-hash a simulated entry, or read the on-chain receipt logs and compare the anchored hash
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses: { '200': { description: '{ mode, verified, message, unavailable? }' } }
+  /api/blockchain/ledger/verify:
+    get: { tags: [Blockchain], summary: Full simulated-ledger integrity scan (REGULATOR, simulation mode), responses: { '200': { description: OK } } }
+  /api/blockchain/retry:
+    post: { tags: [Blockchain], summary: Re-queue failed on-chain writes in order (REGULATOR, on-chain mode), responses: { '200': { description: '{ requeued }' } } }
+  /api/dev/sample-data:
+    post: { tags: [System], summary: 'Development only: load demonstration data (REGULATOR; disabled when NODE_ENV=production)', responses: { '201': { description: Created } } }

@@ -1,0 +1,22 @@
+{
+  "name": "medichain",
+  "version": "1.0.0",
+  "private": true,
+  "description": "MediChain — blockchain-based medicine supply-chain traceability (academic / portfolio project)",
+  "scripts": {
+    "install:all": "npm --prefix apps/api install && npm --prefix apps/web install && npm --prefix packages/contracts install",
+    "db:start": "npm --prefix apps/api run db:start",
+    "db:setup": "npm --prefix apps/api run db:generate && npm --prefix apps/api run db:deploy && npm --prefix apps/api run db:seed",
+    "dev:api": "npm --prefix apps/api run dev",
+    "dev:web": "npm --prefix apps/web run dev",
+    "dev:web:lan": "npm --prefix apps/web run dev:lan",
+    "chain:node": "npm --prefix packages/contracts run node",
+    "chain:deploy": "npm --prefix packages/contracts run deploy:local",
+    "test": "npm run test:contracts && npm run test:api && npm run test:web",
+    "test:api": "npm --prefix apps/api test",
+    "test:web": "npm --prefix apps/web test",
+    "test:contracts": "npm --prefix packages/contracts test",
+    "build": "npm --prefix apps/api run build && npm --prefix apps/web run build",
+    "typecheck": "npm --prefix apps/api run typecheck && npm --prefix apps/web run typecheck"
+  }
+}

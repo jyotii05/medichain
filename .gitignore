@@ -1,0 +1,29 @@
+# dependencies & builds
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# environment & secrets — never commit real credentials or private keys
+.env
+.env.*
+!.env.example
+
+# local data
+.pgdata/
+*.sqlite
+
+# hardhat
+packages/contracts/artifacts/
+packages/contracts/cache/
+packages/contracts/typechain-types/
+packages/contracts/deployments/localhost.json
+packages/contracts/deployments/hardhat.json
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.log
